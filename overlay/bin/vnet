@@ -1,0 +1,84 @@
+#!/bin/sh
+# vnet - simple network helper for VinzOS (wired networks; WiFi is handled by vwifi)
+RUN=/var/run
+IPFILE=$RUN/vnet.ip
+
+wired() {
+    for n in /sys/class/net/*; do
+        i=${n##*/}
+        [ "$i" = lo ] && continue
+        [ -d "$n/wireless" ] && continue
+        [ -e "$n/device" ] || continue
+        echo "$i"
+    done
+}
+
+wireless() {
+    for n in /sys/class/net/*; do
+        [ -d "$n/wireless" ] && echo "${n##*/}"
+    done
+}
+
+do_start() {
+    mkdir -p "$RUN"
+    ifconfig lo up 2>/dev/null
+    rm -f "$IPFILE"
+    for i in $(wired); do
+        ifconfig "$i" up 2>/dev/null
+        udhcpc -i "$i" -t 5 -T 2 -A 5 -p "$RUN/udhcpc.$i.pid" -s /etc/udhcpc.script >/dev/null 2>&1 &
+    done
+    vwifi auto >/dev/null 2>&1 &
+}
+
+do_wait() { # returns 0 online, 1 timeout, 2 no adapter at all
+    max=${1:-12}; n=0
+    [ -n "$(wired)$(wireless)" ] || return 2
+    while [ "$n" -lt "$max" ]; do
+        [ -s "$IPFILE" ] && return 0
+        sleep 1; n=$((n+1))
+    done
+    return 1
+}
+
+do_status() {
+    if [ -s "$IPFILE" ]; then
+        read -r ifc ip < "$IPFILE"
+        echo "Network: connected"
+        echo "  Interface:  $ifc"
+        echo "  IP address: $ip"
+        echo "  DNS:        $(grep nameserver /etc/resolv.conf 2>/dev/null | cut -d' ' -f2 | tr '\n' ' ')"
+    elif [ -z "$(wired)$(wireless)" ]; then
+        echo "Network: no network adapter found."
+        echo "  Tip: USB tethering from a phone shows up as a wired network."
+    else
+        echo "Network: not connected."
+        [ -n "$(wired)" ] && echo "  Wired adapters: $(wired | tr '\n' ' ') (is the cable plugged in?)"
+        [ -n "$(wireless)" ] && echo "  WiFi adapters:  $(wireless | tr '\n' ' ') (connect with: vwifi connect)"
+        echo "  Try: vnet restart"
+    fi
+}
+
+do_test() {
+    printf "Checking DNS...      "
+    nslookup example.com >/dev/null 2>&1 && echo ok || echo FAILED
+    printf "Checking internet... "
+    wget -q -T 8 -O /dev/null http://example.com && echo ok || echo FAILED
+}
+
+case "$1" in
+    start)   do_start ;;
+    stop)    killall udhcpc wpa_supplicant 2>/dev/null; rm -f "$IPFILE" ;;
+    restart) killall udhcpc wpa_supplicant 2>/dev/null; do_start; do_wait 12; do_status ;;
+    wait)    do_wait "$2"; exit $? ;;
+    status|"") do_status ;;
+    test)    do_test ;;
+    *)
+        echo "Usage: vnet <command>"
+        echo
+        echo "  status    Show connection status"
+        echo "  restart   Reconnect"
+        echo "  test      Check DNS and internet access"
+        echo
+        echo "WiFi: use 'vwifi'"
+        ;;
+esac

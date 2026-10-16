@@ -1,0 +1,120 @@
+#!/bin/sh
+# install-vinzos - install VinzOS to a disk (BIOS boot, ext4, extlinux)
+. /usr/lib/vinzos/lib.sh
+
+SHARE=/usr/share/vinzos/syslinux
+TARGET=/mnt/target
+
+die() { echo "Error: $*" >&2; exit 1; }
+step() { echo; echo "[$1/6] $2"; }
+
+[ "$(id -u)" = 0 ] || die "please run as root."
+[ -f /etc/vinzos-installed ] && die "VinzOS is already installed on this computer. The installer only runs from the live USB/CD."
+for t in fdisk mke2fs extlinux; do
+    command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
+done
+
+echo
+echo "=== VinzOS installer ==="
+echo
+
+DISK=${1#/dev/}
+if [ -z "$DISK" ]; then
+    echo "Available disks:"
+    echo
+    i=0
+    for d in $(list_disks); do
+        case "$d" in sr*) continue ;; esac
+        disk_is_busy "$d" && continue
+        i=$((i+1))
+        printf "  %d) %-10s %-10s %s\n" "$i" "$d" "$(human_size "$(dev_sectors "$d")")" "$(disk_model "$d")"
+        eval "DISK_$i=$d"
+    done
+    [ "$i" -gt 0 ] || die "no usable disks found."
+    echo
+    printf "Select a disk number (q to quit): "
+    read -r n
+    case "$n" in q|Q|"") echo "Cancelled."; exit 0 ;; esac
+    case "$n" in *[!0-9]*) die "invalid choice." ;; esac
+    [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || die "invalid choice."
+    eval "DISK=\$DISK_$n"
+fi
+
+[ -d "/sys/block/$DISK" ] || die "/dev/$DISK is not a disk."
+disk_is_busy "$DISK" && die "/dev/$DISK has mounted partitions. Unmount them first (vstorage umount)."
+[ "$(dev_sectors "$DISK")" -ge 1048576 ] || die "the disk is too small (minimum 512 MB)."
+
+echo
+echo "Target disk: /dev/$DISK ($(human_size "$(dev_sectors "$DISK")"), $(disk_model "$DISK"))"
+echo "WARNING: ALL DATA on /dev/$DISK will be ERASED."
+printf "Type the disk name (%s) to continue: " "$DISK"
+read -r ans
+[ "$ans" = "$DISK" ] || { echo "Cancelled."; exit 0; }
+
+step 1 "Partitioning /dev/$DISK"
+make_partition "$DISK" boot || die "partitioning failed."
+PART=$(part_name "$DISK")
+
+step 2 "Formatting /dev/$PART (ext4)"
+mke2fs -q -F -t ext4 -O ^64bit,^metadata_csum -L vinzos "/dev/$PART" || die "format failed."
+
+step 3 "Copying system files"
+mkdir -p "$TARGET"
+mount "/dev/$PART" "$TARGET" || die "cannot mount /dev/$PART."
+cd /
+for d in bin sbin usr etc lib lib64 root var home opt; do
+    [ -e "/$d" ] && cp -a "/$d" "$TARGET/"
+done
+rm -rf "$TARGET"/var/run/* 2>/dev/null
+mkdir -p "$TARGET/proc" "$TARGET/sys" "$TARGET/dev" "$TARGET/tmp" "$TARGET/mnt" "$TARGET/boot/extlinux"
+chmod 1777 "$TARGET/tmp"
+ln -sf /sbin/init "$TARGET/init"
+# the installed system is not a live session: no installer, no installer hint
+touch "$TARGET/etc/vinzos-installed"
+rm -f "$TARGET/sbin/install-vinzos"
+
+KERNEL=""
+if [ -f /boot/bzImage ]; then
+    KERNEL=/boot/bzImage
+else
+    mkdir -p /mnt/cd
+    for c in /dev/sr0 /dev/sr1; do
+        [ -b "$c" ] && mount -t iso9660 -o ro "$c" /mnt/cd 2>/dev/null && break
+    done
+    [ -f /mnt/cd/boot/bzImage ] && KERNEL=/mnt/cd/boot/bzImage
+fi
+[ -n "$KERNEL" ] || { umount "$TARGET"; die "kernel image not found."; }
+cp "$KERNEL" "$TARGET/boot/bzImage"
+
+step 4 "Installing bootloader"
+dd if=/dev/urandom of="/dev/$DISK" bs=1 seek=440 count=4 conv=notrunc 2>/dev/null
+SIG=$(dd if="/dev/$DISK" bs=1 skip=440 count=4 2>/dev/null | od -An -tx4 | tr -d ' \n')
+if [ -n "$SIG" ] && [ "$SIG" != "00000000" ]; then
+    ROOTSPEC="PARTUUID=${SIG}-01"
+else
+    ROOTSPEC="/dev/$PART"
+fi
+cp "$SHARE/ldlinux.c32" "$TARGET/boot/extlinux/"
+cat > "$TARGET/boot/extlinux/extlinux.conf" << EOF
+DEFAULT vinzos
+PROMPT 0
+TIMEOUT 5
+
+LABEL vinzos
+  LINUX /boot/bzImage
+  APPEND root=$ROOTSPEC rw rootwait console=tty0 quiet loglevel=3
+EOF
+extlinux --install "$TARGET/boot/extlinux" >/dev/null 2>&1 || { umount "$TARGET"; die "bootloader install failed."; }
+dd if="$SHARE/mbr.bin" of="/dev/$DISK" bs=440 count=1 conv=notrunc 2>/dev/null
+
+step 5 "Finishing up"
+sync
+umount "$TARGET" || die "could not unmount $TARGET."
+step 6 "Done"
+echo
+echo "VinzOS was installed to /dev/$DISK."
+echo
+echo "  1. Remove the USB drive or CD."
+echo "  2. Type  reboot  to restart into your new system."
+echo "     (To turn the computer off instead, type  shutdown )"
+echo

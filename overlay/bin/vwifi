@@ -1,0 +1,196 @@
+#!/bin/sh
+# vwifi - connect to WiFi networks
+CONF=/etc/wpa_supplicant.conf
+RUN=/var/run
+LIST=/tmp/vwifi.list
+
+wifi_ifaces() { for n in /sys/class/net/*; do [ -d "$n/wireless" ] && echo "${n##*/}"; done; }
+die() { echo "vwifi: $*" >&2; exit 1; }
+
+doctor_hint() {
+    fw=$(dmesg 2>/dev/null | sed -n 's/.*Direct firmware load for \([^ ]*\) failed.*/\1/p' | sort -u)
+    if [ -n "$fw" ]; then
+        echo "Your WiFi adapter needs firmware that is not installed:"
+        for f in $fw; do echo "  $f"; done
+        pkg=""
+        case "$fw" in
+            *iwlwifi*)              pkg=wifi-intel ;;
+            *rtw8*|*rtl*)           pkg=wifi-realtek ;;
+            *ath*|*htc_*)           pkg=wifi-atheros ;;
+            *brcm*)                 pkg=wifi-broadcom ;;
+            *mt7*|*mediatek*)       pkg=wifi-mediatek ;;
+            *rt2*|*rt3*|*rt73*)     pkg=wifi-ralink ;;
+            *mrvl*|*mwifiex*)       pkg=wifi-marvell ;;
+        esac
+        echo
+        if [ -n "$pkg" ]; then
+            echo "You need a wired connection (or USB tethering) once to download it:"
+            echo "  vp install $pkg"
+            echo "  vwifi reload"
+        else
+            echo "Try: vp search wifi"
+        fi
+    else
+        echo "No WiFi adapter was detected."
+        echo "USB WiFi adapters can be plugged in at any time. USB tethering from a phone also works."
+    fi
+}
+
+need_iface() {
+    IF=$(wifi_ifaces | head -n 1)
+    if [ -z "$IF" ]; then
+        echo "No WiFi adapter found."
+        doctor_hint
+        exit 1
+    fi
+}
+
+stop_wifi() {
+    for f in "$RUN/udhcpc.$IF.pid" "$RUN/wpa_supplicant.$IF.pid"; do
+        [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null
+        rm -f "$f"
+    done
+}
+
+start_wifi() {
+    stop_wifi
+    rfkill unblock all 2>/dev/null
+    ifconfig "$IF" up 2>/dev/null
+    wpa_supplicant -B -i "$IF" -c "$CONF" -P "$RUN/wpa_supplicant.$IF.pid" >/dev/null 2>&1 || return 1
+    udhcpc -i "$IF" -t 8 -T 3 -A 5 -p "$RUN/udhcpc.$IF.pid" -s /etc/udhcpc.script >/dev/null 2>&1 &
+}
+
+scan_list() { # prints "signal<TAB>ssid", strongest first
+    rfkill unblock all 2>/dev/null
+    ifconfig "$IF" up 2>/dev/null
+    t=0
+    while [ "$t" -lt 3 ]; do
+        out=$(iw dev "$IF" scan 2>/dev/null | awk '
+            /^BSS /   { if (ssid != "") print sig "\t" ssid; ssid=""; sig="" }
+            /signal:/ { sig=$2 }
+            /SSID:/   { sub(/^[ \t]*SSID: ?/, ""); ssid=$0 }
+            END       { if (ssid != "") print sig "\t" ssid }' | sort -rn | awk -F'\t' '!seen[$2]++')
+        [ -n "$out" ] && break
+        sleep 2; t=$((t+1))
+    done
+    echo "$out"
+}
+
+show_list() { awk -F'\t' '{printf "  %2d) %-32s %s dBm\n", NR, $2, $1}' "$LIST"; }
+
+cmd_scan() {
+    need_iface
+    echo "Scanning on $IF ..."
+    scan_list > "$LIST"
+    [ -s "$LIST" ] || die "no networks found."
+    show_list
+}
+
+cmd_connect() {
+    need_iface
+    ssid=$1; pass=$2
+    if [ -z "$ssid" ]; then
+        echo "Scanning on $IF ..."
+        scan_list > "$LIST"
+        [ -s "$LIST" ] || die "no networks found. Move closer to the router and try again."
+        echo
+        show_list
+        echo
+        printf "Select a network number (q to quit): "
+        read -r n
+        case "$n" in q|Q|"") echo "Cancelled."; return 0 ;; esac
+        case "$n" in *[!0-9]*) die "invalid choice." ;; esac
+        ssid=$(awk -F'\t' -v n="$n" 'NR==n {print $2}' "$LIST")
+        [ -n "$ssid" ] || die "invalid choice."
+    fi
+    if [ -z "$pass" ]; then
+        printf "Password for \"%s\" (leave empty for an open network): " "$ssid"
+        stty -echo 2>/dev/null; read -r pass; stty echo 2>/dev/null
+        echo
+    fi
+    umask 077
+    {
+        echo "ctrl_interface=/var/run/wpa_supplicant"
+        echo "update_config=1"
+        if [ -n "$pass" ]; then
+            wpa_passphrase "$ssid" "$pass" | grep -v '^[[:space:]]*#psk'
+        else
+            printf 'network={\n\tssid="%s"\n\tkey_mgmt=NONE\n}\n' "$ssid"
+        fi
+    } > "$CONF"
+    grep -q 'network=' "$CONF" || { rm -f "$CONF"; die "invalid password (it must be 8 to 63 characters)."; }
+    rm -f "$RUN/vnet.ip"
+    echo "Connecting to \"$ssid\" ..."
+    start_wifi || die "could not start wpa_supplicant."
+    t=0
+    while [ "$t" -lt 25 ]; do
+        if grep -q "^$IF " "$RUN/vnet.ip" 2>/dev/null; then
+            echo "Connected! IP address: $(cut -d' ' -f2 "$RUN/vnet.ip")"
+            return 0
+        fi
+        sleep 1; t=$((t+1))
+    done
+    echo "Could not connect. Check the password and try again: vwifi connect"
+    return 1
+}
+
+cmd_status() {
+    need_iface
+    iw dev "$IF" link 2>/dev/null
+    [ -s "$RUN/vnet.ip" ] && echo "IP: $(cut -d' ' -f2 "$RUN/vnet.ip")"
+}
+
+cmd_disconnect() { need_iface; stop_wifi; ifconfig "$IF" 0.0.0.0 2>/dev/null; echo "Disconnected."; }
+cmd_forget() { rm -f "$CONF"; echo "Saved WiFi password removed."; }
+
+cmd_auto() { # called at boot: reconnect to the saved network
+    [ -f "$CONF" ] || exit 0
+    t=0
+    while [ -z "$(wifi_ifaces)" ] && [ "$t" -lt 8 ]; do sleep 1; t=$((t+1)); done
+    IF=$(wifi_ifaces | head -n 1)
+    [ -n "$IF" ] && start_wifi
+}
+
+cmd_reload() {
+    echo "Reloading WiFi drivers ..."
+    for pass in 1 2 3; do
+        for m in $(lsmod | awk 'NR>1 {print $1}'); do
+            case "$m" in
+                iwl*|ath*|rtw*|rtl8*|brcm*|rt2*|rt61*|rt73*|mt7*|mwifiex*|zd1211*|mac80211|cfg80211|libarc4)
+                    modprobe -r -q "$m" 2>/dev/null ;;
+            esac
+        done
+    done
+    cat $(find /sys/devices -name modalias -type f 2>/dev/null) 2>/dev/null | sort -u | xargs modprobe -q -a 2>/dev/null
+    sleep 3
+    if [ -n "$(wifi_ifaces)" ]; then echo "WiFi adapter ready: $(wifi_ifaces | tr '\n' ' ')"; else doctor_hint; fi
+}
+
+usage() {
+    cat << EOF
+Usage: vwifi <command>
+
+  connect [name] [password]   Connect to a WiFi network (shows a list if no name is given)
+  scan                        List nearby networks
+  status                      Show the current WiFi connection
+  disconnect                  Disconnect
+  forget                      Remove the saved WiFi password
+  reload                      Reload WiFi drivers (use after installing firmware)
+  doctor                      Explain why WiFi is not working
+EOF
+}
+
+cmd=$1; [ $# -gt 0 ] && shift
+case "$cmd" in
+    connect) cmd_connect "$@" ;;
+    scan) cmd_scan ;;
+    status) cmd_status ;;
+    disconnect) cmd_disconnect ;;
+    forget) cmd_forget ;;
+    auto) cmd_auto ;;
+    reload) cmd_reload ;;
+    doctor) doctor_hint ;;
+    has) [ -n "$(wifi_ifaces)" ] ;;
+    ""|help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+esac

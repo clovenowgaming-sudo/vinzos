@@ -1,0 +1,27 @@
+#!/bin/sh
+cat << EOF
+VinzOS quick help
+
+  Power
+    shutdown            Turn the computer off
+    reboot              Restart the computer
+
+  Network
+    vnet status         Show the network status
+    vwifi connect       Connect to WiFi
+    vnet test           Check that the internet works
+
+  Software
+    vp install <name>   Install a program
+    vp search <text>    Search for programs
+    vp list             Show installed programs
+    vp upgrade          Upgrade installed programs
+
+  Disks
+    vstorage list       Show disks and USB drives
+    vstorage mount      Mount a drive (vstorage help for more)
+    install-vinzos      Install VinzOS to a disk (live session only)
+
+  Files
+    ls  cd  cp  mv  rm  mkdir  vi
+EOF

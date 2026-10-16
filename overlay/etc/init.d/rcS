@@ -1,0 +1,50 @@
+#!/bin/sh
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /var/run /var/lib/vp /var/log /mnt
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /tmp
+hostname vinzos
+mount -o remount,rw / 2>/dev/null
+hwclock -s -u 2>/dev/null
+
+# load drivers for all detected hardware, then for hardware plugged in later
+cat $(find /sys/devices -name modalias -type f 2>/dev/null) 2>/dev/null | sort -u | xargs modprobe -q -a 2>/dev/null
+echo /sbin/uevent-helper > /proc/sys/kernel/hotplug 2>/dev/null
+mount -a 2>/dev/null
+
+echo
+echo "  VinzOS 0.3"
+echo "  A lightweight Linux-based operating system"
+echo
+printf "  Starting network... "
+vnet start
+vnet wait 12
+case $? in
+    0)
+        echo "connected ($(cut -d' ' -f2 /var/run/vnet.ip))"
+        ntpd -q -n -p pool.ntp.org >/dev/null 2>&1 &
+        ;;
+    2)
+        echo "no network adapter found"
+        ;;
+    *)
+        echo "not connected"
+        if vwifi has; then
+            echo "  A WiFi adapter was found. Connect with:  vwifi connect"
+        else
+            echo "  Plug in a network cable, or type 'vnet status' for details."
+        fi
+        ;;
+esac
+echo
+echo "  Connect to WiFi:    vwifi connect"
+echo "  Install software:   vp install <package>"
+[ -f /etc/vinzos-installed ] || echo "  Install to a disk:  install-vinzos"
+echo "  Manage storage:     vstorage help"
+echo "  Shut down:          shutdown"
+echo "  Restart:            reboot"
+echo "  All commands:       help"
+echo

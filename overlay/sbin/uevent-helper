@@ -1,0 +1,4 @@
+#!/bin/sh
+# Called by the kernel when hardware appears: load the matching driver
+[ "$ACTION" = add ] && [ -n "$MODALIAS" ] && modprobe -q "$MODALIAS" 2>/dev/null
+exit 0

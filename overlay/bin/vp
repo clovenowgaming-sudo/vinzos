@@ -1,0 +1,177 @@
+#!/bin/sh
+# vp - the VinzOS package manager
+DB="${VP_DB:-/var/lib/vp}"
+ROOTDIR="${VP_ROOT:-/}"
+REPO_FILE="${VP_REPO_FILE:-/etc/vp.repo}"
+INDEX="$DB/index"
+DL="$DB/dl"
+mkdir -p "$DB/installed" "$DL"
+
+die() { echo "vp: $*" >&2; exit 1; }
+
+repo_url() { r=$(cat "$REPO_FILE" 2>/dev/null); echo "${r%/}"; }
+
+need_repo() {
+    REPO=$(repo_url)
+    case "$REPO" in
+        ""|*CHANGE-ME*) die "no package server configured. Set one with: vp repo set <url>" ;;
+    esac
+}
+
+fetch() { # <url> <dest> [progress]
+    if command -v curl >/dev/null 2>&1; then
+        if [ "$3" = progress ]; then
+            curl -fL --progress-bar --connect-timeout 15 --max-time 1800 -o "$2" "$1" || { rm -f "$2"; return 1; }
+        else
+            curl -fsSL --connect-timeout 15 --max-time 120 -o "$2" "$1" || { rm -f "$2"; return 1; }
+        fi
+    else
+        wget -q -T 30 -O "$2" "$1" || { rm -f "$2"; return 1; }
+    fi
+}
+
+cmd_update() {
+    need_repo
+    echo "Fetching package list from $REPO ..."
+    fetch "$REPO/index" "$INDEX.new" || die "cannot reach the package server. Check your connection with: vnet status"
+    mv "$INDEX.new" "$INDEX"
+    echo "Done. $(wc -l < "$INDEX") packages available."
+}
+
+need_index() { [ -s "$INDEX" ] || cmd_update; }
+pkg_line() { awk -F'|' -v p="$1" '$1==p {print; exit}' "$INDEX"; }
+pkg_field() { echo "$1" | cut -d'|' -f"$2"; }
+is_installed() { [ -f "$DB/installed/$1.files" ]; }
+
+fetch_extract() {
+    n=$1; line=$(pkg_line "$n"); want=$(pkg_field "$line" 5)
+    tmp="$DL/$n.tar.gz"
+    fetch "$REPO/$n.tar.gz" "$tmp" progress || die "download failed: $n"
+    if [ -n "$want" ]; then
+        got=$(sha256sum "$tmp" | cut -d' ' -f1)
+        [ "$got" = "$want" ] || { rm -f "$tmp"; die "checksum mismatch for $n (the download is damaged or was changed)."; }
+    fi
+    tar tzf "$tmp" > "$DB/installed/$n.files.new" 2>/dev/null || { rm -f "$tmp" "$DB/installed/$n.files.new"; die "corrupt package: $n"; }
+    tar xzf "$tmp" -C "$ROOTDIR" || { rm -f "$tmp" "$DB/installed/$n.files.new"; die "could not unpack: $n"; }
+    mv "$DB/installed/$n.files.new" "$DB/installed/$n.files"
+    rm -f "$tmp"
+}
+
+install_one() {
+    name=$1
+    if is_installed "$name"; then echo "$name is already installed."; return 0; fi
+    line=$(pkg_line "$name")
+    [ -n "$line" ] || die "package not found: $name (try: vp update, vp search)"
+    ver=$(pkg_field "$line" 2); deps=$(pkg_field "$line" 3)
+    for dep in $deps; do install_one "$dep"; done
+    echo "Installing $name $ver ..."
+    fetch_extract "$name"
+    echo "$ver" > "$DB/installed/$name.ver"
+    echo "$name installed."
+}
+
+cmd_install() {
+    [ $# -gt 0 ] || die "usage: vp install <package> [...]"
+    need_repo; need_index
+    for p in "$@"; do install_one "$p"; done
+}
+
+cmd_remove() {
+    [ $# -gt 0 ] || die "usage: vp remove <package> [...]"
+    for p in "$@"; do
+        is_installed "$p" || { echo "$p is not installed."; continue; }
+        if [ -s "$INDEX" ]; then
+            for v in "$DB"/installed/*.ver; do
+                [ -e "$v" ] || continue
+                o=${v##*/}; o=${o%.ver}
+                case " $(pkg_field "$(pkg_line "$o")" 3) " in
+                    *" $p "*) die "cannot remove $p: $o depends on it." ;;
+                esac
+            done
+        fi
+        grep -v '/$' "$DB/installed/$p.files" | while read -r f; do rm -f "$ROOTDIR/$f"; done
+        grep '/$' "$DB/installed/$p.files" | sort -r | while read -r d; do rmdir "$ROOTDIR/$d" 2>/dev/null; done
+        rm -f "$DB/installed/$p.files" "$DB/installed/$p.ver"
+        echo "$p removed."
+    done
+}
+
+cmd_list() {
+    found=0
+    for v in "$DB"/installed/*.ver; do
+        [ -e "$v" ] || continue
+        n=${v##*/}; n=${n%.ver}
+        echo "$n $(cat "$v")"; found=1
+    done
+    [ "$found" = 1 ] || echo "No packages installed."
+}
+
+cmd_search() {
+    need_index
+    awk -F'|' -v q="$1" 'BEGIN{q=tolower(q)} tolower($1 " " $4) ~ q {printf "%-16s %-10s %s\n", $1, $2, $4}' "$INDEX"
+}
+
+cmd_info() {
+    [ -n "$1" ] || die "usage: vp info <package>"
+    need_index
+    line=$(pkg_line "$1")
+    [ -n "$line" ] || die "package not found: $1"
+    echo "Name:         $(pkg_field "$line" 1)"
+    echo "Version:      $(pkg_field "$line" 2)"
+    echo "Depends on:   $(pkg_field "$line" 3)"
+    echo "Description:  $(pkg_field "$line" 4)"
+    is_installed "$1" && echo "Status:       installed" || echo "Status:       not installed"
+}
+
+cmd_upgrade() {
+    need_repo; cmd_update
+    up=0
+    for v in "$DB"/installed/*.ver; do
+        [ -e "$v" ] || continue
+        n=${v##*/}; n=${n%.ver}; cur=$(cat "$v")
+        line=$(pkg_line "$n"); [ -n "$line" ] || continue
+        new=$(pkg_field "$line" 2)
+        if [ "$new" != "$cur" ]; then
+            echo "Upgrading $n $cur -> $new"
+            fetch_extract "$n"; echo "$new" > "$v"; up=$((up+1))
+        fi
+    done
+    echo "$up package(s) upgraded."
+}
+
+cmd_repo() {
+    case "$1" in
+        set) [ -n "$2" ] || die "usage: vp repo set <url>"; echo "$2" > "$REPO_FILE"; echo "Package server set to $2" ;;
+        *)   echo "Package server: $(repo_url)" ;;
+    esac
+}
+
+usage() {
+    cat << EOF
+Usage: vp <command> [arguments]
+
+  install <pkg>...   Install packages
+  remove <pkg>...    Remove packages
+  update             Refresh the package list
+  upgrade            Upgrade installed packages
+  search <text>      Search available packages
+  info <pkg>         Show package details
+  list               List installed packages
+  repo [set <url>]   Show or change the package server
+  help               Show this help
+EOF
+}
+
+cmd=$1; [ $# -gt 0 ] && shift
+case "$cmd" in
+    install) cmd_install "$@" ;;
+    remove)  cmd_remove "$@" ;;
+    update)  cmd_update ;;
+    upgrade) cmd_upgrade ;;
+    search)  cmd_search "$@" ;;
+    info)    cmd_info "$@" ;;
+    list)    cmd_list ;;
+    repo)    cmd_repo "$@" ;;
+    help|-h|--help|"") usage ;;
+    *) usage; exit 1 ;;
+esac

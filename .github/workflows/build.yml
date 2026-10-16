@@ -1,0 +1,51 @@
+name: build-vinzos
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i386]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-multilib bc flex bison libssl-dev libelf-dev cpio xz-utils wget xorriso isolinux syslinux-common debootstrap kmod python3
+      - name: Build
+        run: bash build.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vinzos-${{ matrix.arch }}
+          path: out/${{ matrix.arch }}/
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Make one zip (32-bit and 64-bit separated)
+        run: |
+          mkdir -p pkg/vinzos-64bit pkg/vinzos-32bit
+          cp dl/vinzos-x86_64/* pkg/vinzos-64bit/
+          cp dl/vinzos-i386/* pkg/vinzos-32bit/
+          cp dist-README.txt pkg/README.txt
+          (cd pkg && zip -r ../vinzos-all.zip .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vinzos-all
+          path: vinzos-all.zip
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" vinzos-all.zip \
+            --repo "${{ github.repository }}" \
+            --title "VinzOS build ${{ github.run_number }}" \
+            --notes "vinzos-all.zip contains vinzos-64bit/ and vinzos-32bit/ (ISO, kernel, initramfs)."

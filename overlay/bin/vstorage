@@ -1,0 +1,176 @@
+#!/bin/sh
+# vstorage - list, mount, add and remove storage devices
+. /usr/lib/vinzos/lib.sh
+FSTAB=/etc/fstab
+
+die() { echo "vstorage: $*" >&2; exit 1; }
+
+usage() {
+    cat << EOF
+Usage: vstorage <command> [arguments]
+
+Commands:
+  list                    Show disks, partitions and where they are mounted
+  mount [-p] <dev> [name] Mount a device at /mnt/<name> (-p = remember at boot)
+  umount <dev|name>       Safely unmount a device
+  add [dev]               Prepare a new device: partition, format, mount, remember
+  remove <dev|name>       Unmount and forget a device (data is kept)
+  help                    Show this help
+
+Examples:
+  vstorage list
+  vstorage mount sdb1 usb
+  vstorage add sdb
+  vstorage remove usb
+EOF
+}
+
+resolve_dev() { # device name, /dev/name, mount name or mount path -> device name
+    x=${1#/dev/}
+    if [ -b "/dev/$x" ]; then echo "$x"; return 0; fi
+    mp=$1; [ -d "$mp" ] || mp="/mnt/$1"
+    dev=$(awk -v m="$mp" '$2==m {print $1; exit}' /proc/mounts)
+    [ -n "$dev" ] && { echo "${dev#/dev/}"; return 0; }
+    return 1
+}
+
+fstab_add() {
+    uuid=$(dev_info "$1" UUID); fs=$(dev_info "$1" TYPE)
+    [ -n "$uuid" ] || { echo "Note: cannot remember this device (no UUID)."; return 1; }
+    fstab_remove "$uuid"
+    echo "UUID=$uuid $2 $fs defaults 0 0" >> "$FSTAB"
+    echo "It will be mounted automatically at boot."
+}
+
+fstab_remove() {
+    [ -f "$FSTAB" ] || return 0
+    grep -v "UUID=$1 " "$FSTAB" > "$FSTAB.new"
+    mv "$FSTAB.new" "$FSTAB"
+}
+
+row() {
+    n=$1; ind=$2
+    t=$(dev_info "$n" TYPE); l=$(dev_info "$n" LABEL)
+    printf "%-12s %-10s %-8s %-12s %s\n" "$ind$n" "$(human_size "$(dev_sectors "$n")")" "${t:--}" "${l:--}" "$(mount_point_of "$n")"
+}
+
+cmd_list() {
+    printf "%-12s %-10s %-8s %-12s %s\n" NAME SIZE FS LABEL "MOUNTED ON"
+    for d in $(list_disks); do
+        row "$d" ""
+        for p in $(disk_parts "$d"); do row "$p" " "; done
+    done
+}
+
+cmd_mount() {
+    persist=0
+    if [ "$1" = "-p" ]; then persist=1; shift; fi
+    [ -n "$1" ] || die "usage: vstorage mount [-p] <dev> [name]"
+    dev=$(resolve_dev "$1") || die "device not found: $1"
+    old=$(mount_point_of "$dev")
+    if [ -n "$old" ]; then echo "/dev/$dev is already mounted on $old"; return 0; fi
+    fs=$(dev_info "$dev" TYPE)
+    [ -n "$fs" ] || die "/dev/$dev has no known filesystem. Use 'vstorage add $dev' to prepare it."
+    name=$2
+    [ -n "$name" ] || name=$(dev_info "$dev" LABEL)
+    [ -n "$name" ] || name=$dev
+    mp=/mnt/$name
+    mkdir -p "$mp"
+    mount "/dev/$dev" "$mp" || { rmdir "$mp" 2>/dev/null; die "mount failed."; }
+    echo "Mounted /dev/$dev ($fs) on $mp"
+    [ "$persist" = 1 ] && fstab_add "$dev" "$mp"
+    return 0
+}
+
+cmd_umount() {
+    [ -n "$1" ] || die "usage: vstorage umount <dev|name>"
+    dev=$(resolve_dev "$1") || die "device not found: $1"
+    mp=$(mount_point_of "$dev")
+    [ -n "$mp" ] || { echo "/dev/$dev is not mounted."; return 0; }
+    [ "$mp" = "/" ] && die "cannot unmount the system disk."
+    sync
+    umount "$mp" || die "unmount failed. Is it in use? Try: cd /"
+    case "$mp" in /mnt/*) rmdir "$mp" 2>/dev/null ;; esac
+    echo "/dev/$dev unmounted. It is now safe to remove."
+}
+
+cmd_remove() {
+    [ -n "$1" ] || die "usage: vstorage remove <dev|name>"
+    dev=$(resolve_dev "$1") || die "device not found: $1"
+    uuid=$(dev_info "$dev" UUID)
+    [ -n "$(mount_point_of "$dev")" ] && cmd_umount "$dev"
+    [ -n "$uuid" ] && fstab_remove "$uuid"
+    echo "/dev/$dev was removed from the system. Its data was not erased."
+}
+
+cmd_add() {
+    dev=${1#/dev/}
+    if [ -z "$dev" ]; then
+        echo "Storage devices not in use:"
+        i=0
+        for d in $(list_disks); do
+            case "$d" in sr*) continue ;; esac
+            disk_is_busy "$d" && continue
+            i=$((i+1))
+            printf "  %d) %-10s %-10s %s\n" "$i" "$d" "$(human_size "$(dev_sectors "$d")")" "$(disk_model "$d")"
+            eval "ADD_$i=$d"
+        done
+        [ "$i" -gt 0 ] || die "no unused storage devices found."
+        printf "Select a number (q to quit): "
+        read -r n
+        case "$n" in q|Q|"") echo "Cancelled."; return 0 ;; esac
+        case "$n" in *[!0-9]*) die "invalid choice." ;; esac
+        [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || die "invalid choice."
+        eval "dev=\$ADD_$n"
+    fi
+    [ -b "/dev/$dev" ] || die "device not found: $dev"
+    if [ -d "/sys/block/$dev" ]; then
+        isdisk=1
+        disk_is_busy "$dev" && die "/dev/$dev is in use. Unmount it first."
+    else
+        isdisk=0
+        [ -n "$(mount_point_of "$dev")" ] && die "/dev/$dev is in use. Unmount it first."
+    fi
+
+    fs=$(dev_info "$dev" TYPE)
+    if [ -n "$fs" ]; then
+        printf "/dev/%s already contains a %s filesystem. Keep the data and just mount it? [Y/n] " "$dev" "$fs"
+        read -r a
+        case "$a" in n|N) ;; *) cmd_mount -p "$dev"; return 0 ;; esac
+    elif [ "$isdisk" = 1 ] && [ -n "$(disk_parts "$dev")" ]; then
+        echo "/dev/$dev has partitions: $(disk_parts "$dev" | tr '\n' ' ')"
+        echo "To use an existing partition run: vstorage mount <partition>"
+    fi
+
+    echo "WARNING: ALL DATA on /dev/$dev will be ERASED."
+    printf "Type the device name (%s) to continue: " "$dev"
+    read -r a
+    [ "$a" = "$dev" ] || { echo "Cancelled."; return 0; }
+    printf "Name for this storage [data]: "
+    read -r name
+    name=${name:-data}
+    case "$name" in *[!A-Za-z0-9_-]*) die "name may only contain letters, numbers, - and _." ;; esac
+    [ ${#name} -le 16 ] || die "name is too long (max 16 characters)."
+
+    if [ "$isdisk" = 1 ]; then
+        echo "Creating partition..."
+        make_partition "$dev" || die "partitioning failed."
+        target=$(part_name "$dev")
+    else
+        target=$dev
+    fi
+    echo "Formatting /dev/$target as ext4..."
+    mke2fs -q -F -t ext4 -L "$name" "/dev/$target" || die "format failed."
+    cmd_mount -p "$target" "$name"
+}
+
+cmd=$1; [ $# -gt 0 ] && shift
+case "$cmd" in
+    list|"") cmd_list ;;
+    mount)   cmd_mount "$@" ;;
+    umount|unmount) cmd_umount "$@" ;;
+    add)     cmd_add "$@" ;;
+    remove)  cmd_remove "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+esac

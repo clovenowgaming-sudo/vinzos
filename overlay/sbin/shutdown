@@ -1,0 +1,9 @@
+#!/bin/sh
+# shutdown - turn the computer off ("shutdown -r" restarts it)
+action=poweroff
+for a in "$@"; do
+    case "$a" in -r|--reboot) action=reboot ;; esac
+done
+echo "System is going down now..."
+sync
+exec "$action"
