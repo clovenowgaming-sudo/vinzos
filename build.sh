@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # VinzOS builder. Usage: ./build.sh <x86_64|i386>
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "build.sh failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 ARCH="${1:-x86_64}"
 KVER="${KVER:-6.12.1}"
 BBVER="${BBVER:-1.36.1}"
@@ -87,23 +88,10 @@ rm -rf "$RFS"
 echo "==> [$ARCH] Tool chroot (Debian bookworm / $DEBARCH)"
 sudo rm -rf "$CH"
 sudo debootstrap --arch="$DEBARCH" --variant=minbase \
-  --include=extlinux,e2fsprogs,kmod,wpasupplicant,iw,curl,ca-certificates,wireless-regdb \
+  --include=extlinux,syslinux-common,e2fsprogs,kmod,wpasupplicant,iw,curl,ca-certificates,wireless-regdb \
   bookworm "$CH" http://deb.debian.org/debian
 
-where() { sudo chroot "$CH" env PATH=/usr/sbin:/usr/bin:/sbin:/bin sh -c "command -v $1"; }
-real()  { sudo chroot "$CH" readlink -f "$1"; }
-copy_file() { # <path in chroot> [dest in rootfs] [mode]
-  local src="$1" dest="${2:-$1}" r
-  r=$(real "$src")
-  install -D -m "${3:-755}" "$CH$r" "$RFS$dest"
-}
-copy_bin() { # binary + all shared libraries it needs
-  local src="$1" l
-  copy_file "$src"
-  sudo chroot "$CH" ldd "$src" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | sort -u | while read -r l; do
-    [ -e "$RFS$l" ] || copy_file "$l"
-  done
-}
+CD=(python3 "$ROOT/tools/copydeps.py" "$CH" "$RFS")
 
 # ---------------------------------------------------------------- rootfs
 echo "==> [$ARCH] Rootfs"
@@ -111,22 +99,18 @@ cd "$RFS"
 mkdir -p proc sys dev tmp root var/lib/vp var/run mnt boot lib/firmware usr/share/vinzos/syslinux etc/ssl/certs
 cp -a "$ROOT/overlay/." .
 
-for b in mke2fs extlinux wpa_supplicant wpa_cli wpa_passphrase iw curl kmod; do
-  copy_bin "$(where $b)"
-done
-KMOD_PATH=$(where kmod)
+"${CD[@]}" bin mke2fs extlinux wpa_supplicant wpa_cli wpa_passphrase iw curl kmod
+KMOD_PATH=$("${CD[@]}" bin kmod)
 for t in modprobe depmod insmod lsmod rmmod modinfo; do
   rm -f "sbin/$t" "bin/$t"; ln -s "$KMOD_PATH" "bin/$t"
 done
-copy_file /etc/mke2fs.conf /etc/mke2fs.conf 644 || true
-copy_file /usr/lib/syslinux/mbr/mbr.bin /usr/share/vinzos/syslinux/mbr.bin 644
-copy_file /usr/lib/syslinux/modules/bios/ldlinux.c32 /usr/share/vinzos/syslinux/ldlinux.c32 644
-copy_file /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt 644
+"${CD[@]}" libs libnss_files.so.2 libnss_dns.so.2 libresolv.so.2
+"${CD[@]}" file /etc/mke2fs.conf /etc/mke2fs.conf 644 || true
+"${CD[@]}" file /usr/lib/syslinux/mbr/mbr.bin /usr/share/vinzos/syslinux/mbr.bin 644
+"${CD[@]}" file /usr/lib/syslinux/modules/bios/ldlinux.c32 /usr/share/vinzos/syslinux/ldlinux.c32 644
+"${CD[@]}" file /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt 644
 for f in regulatory.db regulatory.db.p7s; do
-  copy_file "/lib/firmware/$f" "/lib/firmware/$f" 644 || echo "note: $f not found"
-done
-for f in $(sudo chroot "$CH" sh -c 'ls /usr/lib/*-linux-gnu/libnss_files.so.2 /usr/lib/*-linux-gnu/libnss_dns.so.2 /usr/lib/*-linux-gnu/libresolv.so.2'); do
-  copy_file "$f" "/lib${f#/usr/lib}"
+  "${CD[@]}" file "/lib/firmware/$f" "/lib/firmware/$f" 644 || echo "note: $f not found"
 done
 printf 'hosts: files dns\n' > etc/nsswitch.conf
 echo '127.0.0.1 localhost' > etc/hosts
